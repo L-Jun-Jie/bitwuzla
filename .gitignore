@@ -6,3 +6,26 @@ build/
 subprojects/*
 !/subprojects/packagefiles
 !subprojects/*.wrap
+
+# LaTeX build artifacts in the design document directory
+/tex/*.aux
+/tex/*.bbl
+/tex/*.bcf
+/tex/*.blg
+/tex/*.dvi
+/tex/*.fdb_latexmk
+/tex/*.fls
+/tex/*.lof
+/tex/*.log
+/tex/*.lot
+/tex/*.nav
+/tex/*.out
+/tex/*.pdf
+/tex/*.ps
+/tex/*.run.xml
+/tex/*.snm
+/tex/*.synctex.gz
+/tex/*.toc
+/tex/*.vrb
+/tex/*.xdv
+/tex/_minted-*/

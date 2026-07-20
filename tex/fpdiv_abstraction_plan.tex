@@ -1,0 +1,519 @@
+\documentclass[runningheads]{llncs}
+
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+
+\setlength{\emergencystretch}{1em}
+
+\newcommand{\fpdiv}{\mathop{\mathsf{fp.div}}}
+\newcommand{\isnan}{\mathsf{NaN}}
+\newcommand{\isinf}{\mathsf{Inf}}
+\newcommand{\iszero}{\mathsf{Zero}}
+\newcommand{\signbit}{\mathsf{Neg}}
+\newcommand{\proxy}{\alpha_d}
+\newcommand{\true}{\mathsf{true}}
+\newcommand{\false}{\mathsf{false}}
+
+\lstdefinestyle{plan}{
+  basicstyle=\ttfamily\small,
+  columns=fullflexible,
+  keepspaces=true,
+  frame=single,
+  rulecolor=\color{black!25},
+  xleftmargin=0.5em,
+  xrightmargin=0.5em,
+  aboveskip=0.7em,
+  belowskip=0.7em
+}
+
+\title{Term-Level Abstraction and Classification Refinement for
+Floating-Point Division in Bitwuzla}
+
+\titlerunning{FP Division Abstraction in Bitwuzla}
+
+\author{Anonymous Author(s)}
+\authorrunning{Anonymous Author(s)}
+\institute{Anonymous Institution\\
+\email{anonymous@example.org}}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This design note proposes the first floating-point extension of Bitwuzla's
+term-level abstraction module.  The initial scope is deliberately restricted
+to floating-point division.  Each selected \(\fpdiv\) term is replaced by a
+fresh, valid floating-point proxy.  Candidate models are checked against the
+concrete division semantics, and refinement starts with inexpensive
+classification lemmas for NaN, infinity, zero, and sign.  If classification
+refinement cannot eliminate an inconsistent candidate, the first prototype
+falls back to an exact semantic link and the existing SymFPU encoding.  This
+preserves soundness and completeness while isolating the main research
+question: how much of the full divider can be avoided by class-first
+refinement?
+
+\keywords{SMT solving \and floating-point arithmetic \and abstraction
+\and refinement \and bit-blasting}
+\end{abstract}
+
+% CAV uses the Springer LNCS format, whose top-level units are sections.
+% Sections 1 and 2 correspond to the two requested design chapters.
+
+\section{Top-Level Design}
+\label{sec:top-level}
+
+\subsection{Scope and design goals}
+
+The first milestone adds term-level abstraction for \emph{only}
+\(\mathsf{FP\_DIV}\).  Let
+\[
+  d = \fpdiv(r,x,y),
+\]
+where \(r\) is a rounding-mode term and \(x,y\) have the same floating-point
+format.  After rewriting, the abstraction module replaces every occurrence of
+\(d\) by a shared proxy \(\proxy\) of the same floating-point type:
+\[
+  \varphi[d] \quad\longmapsto\quad \widehat{\varphi}[\proxy].
+\]
+The proxy initially has no division semantics.  It is constrained only to be
+a valid floating-point value.  Consequently,
+\(\widehat{\varphi}\) over-approximates the original formula.
+
+The milestone has four goals.
+\begin{enumerate}
+  \item Reuse the existing \texttt{AM\_ABSTRACT} representation and the
+        abstraction/refinement loop introduced for bit-vectors
+        \cite{niemetz2024abstraction}.
+  \item Prevent the original \(\fpdiv\) term from being word-blasted until an
+        exact fallback is required.
+  \item Add operation-specific classification lemmas before any full SymFPU
+        division encoding.
+  \item Preserve the result of Bitwuzla with abstraction disabled: no
+        approximate SAT answer is permitted.
+\end{enumerate}
+
+The following features are explicitly outside the first milestone:
+\(\mathsf{FP\_ADD}\), \(\mathsf{FP\_MUL}\), \(\mathsf{FP\_FMA}\),
+\(\mathsf{FP\_SQRT}\), predicates with Boolean result, conversions with
+bit-vector result, and partial operators such as \(\mathsf{FP\_MIN}\) and
+\(\mathsf{FP\_MAX}\).  Ground divisions are expected to disappear through
+constant folding before abstraction.
+
+\subsection{Semantic contract}
+
+The implementation must maintain the following invariants.
+
+\paragraph{Typed proxy.}
+For each rewritten node \(d\), create exactly one proxy \(\proxy\), preserve
+DAG sharing, and give \(\proxy\) the type of \(d\).  A floating-point proxy is
+treated as a symbolic leaf by the FP word-blaster.  Its unpacked
+NaN/Inf/Zero/sign/exponent/significand fields must satisfy the same validity
+constraint as an ordinary symbolic FP constant.
+
+\paragraph{No accidental expansion.}
+The word-blaster must stop at \(\proxy\); it must not descend through the
+internal child of \texttt{AM\_ABSTRACT} to \(d\).  Classification lemmas may
+mention \(r,x,y,\proxy\), but must not mention \(d\).  Otherwise merely
+classifying the result could construct the complete symbolic divider.
+
+\paragraph{Exact candidate validation.}
+For every SAT candidate, obtain the model values
+\(v_r,v_x,v_y,v_{\proxy}\) and evaluate
+\[
+  v_d = \fpdiv(v_r,v_x,v_y)
+\]
+with Bitwuzla's existing FP evaluator.  The abstraction is consistent only if
+\(v_{\proxy}=v_d\) under SMT equality.  In particular, this equality
+distinguishes \(+0\) from \(-0\) and uses the SMT treatment of NaN; it is
+\emph{not} the IEEE predicate \(\mathsf{fp.eq}\).
+
+\paragraph{Complete fallback.}
+Classification lemmas alone do not determine a finite quotient.  If the
+candidate remains inconsistent after all applicable class refinements, the
+first implementation adds
+\[
+  \proxy = \fpdiv(r,x,y).
+  \tag{Full-Link}
+\]
+The lemma must be passed through the ``do not abstract this lemma'' path so
+that the right-hand-side division is word-blasted rather than abstracted
+again.  This fallback bounds the refinement loop and restores the current
+SymFPU semantics \cite{symfpu}.
+
+\subsection{Solver pipeline}
+
+The proposed data flow is as follows.
+
+\begin{enumerate}
+  \item \textbf{Rewrite and select.}  Process the formula bottom-up.  If a
+        rewritten node has kind \(\mathsf{FP\_DIV}\), contains symbolic data,
+        and the new option is enabled, replace it by \(\proxy\).
+  \item \textbf{Build the abstract FP formula.}  The existing FP solver
+        word-blasts surrounding predicates and equalities, but treats
+        \(\proxy\) as a valid symbolic FP leaf.  The arithmetic divider for
+        \(d\) is absent from this encoding.
+  \item \textbf{Obtain a candidate.}  The BV/SAT engine returns an assignment;
+        the current solve order then lets the FP solver establish valid proxy
+        fields before the abstraction module checks \(\proxy\).
+  \item \textbf{Check exact semantics.}  Evaluate \(d\) on the candidate
+        operand values.  If \(v_{\proxy}=v_d\), this abstraction is consistent.
+  \item \textbf{Refine class first.}  On a mismatch, test the classification
+        lemmas from Sect.~\ref{sec:class-lemmas} and add a violated lemma.
+  \item \textbf{Fall back if necessary.}  If no class lemma rejects the
+        inconsistent candidate, add Full-Link.  Later work may insert value,
+        exponent, or significand refinements before this step.
+\end{enumerate}
+
+The first implementation should retain the existing ordering
+\[
+  \text{BV/SAT solve} \to \text{FP check} \to
+  \text{abstraction check} \to \text{array/UF checks}.
+\]
+Reordering is unnecessary if FP proxies are valid word-blaster leaves and
+their model values can be recovered through \texttt{FpSolver::value()}.
+
+\subsection{Required code changes}
+
+Table~\ref{tab:changes} summarizes the expected change surface.  Keeping the
+FP-specific checker separate from the current binary-BV checker avoids
+hard-coded assumptions about arity and bit-vector width.
+
+\begin{table}[t]
+\centering
+\caption{Planned implementation changes.}
+\label{tab:changes}
+\small
+\begin{tabular}{p{0.25\textwidth}p{0.66\textwidth}}
+\toprule
+Component & Planned change \\
+\midrule
+Options
+  & Add an experimental, default-off \texttt{abstraction-fp-div} option under
+    the existing abstraction master switch.  Do not reuse
+    \texttt{abstraction-bv-size}. \\
+Abstraction selection
+  & Extend \texttt{AbstractionModule::abstract()} with an FP-specific branch
+    for \texttt{Kind::FP\_DIV}.  Reuse the process cache to preserve sharing. \\
+FP refinement checker
+  & Add \texttt{check\_term\_abstraction\_fp\_div()}; read one RM and two FP
+    operands, perform exact candidate evaluation, then use the class-first
+    schedule. \\
+FP word-blaster
+  & Recognize FP-typed \texttt{AM\_ABSTRACT} as a symbolic FP leaf, add its
+    validity constraint, and do not traverse its hidden original child. \\
+Model values
+  & Permit \texttt{FpSolver::value()} to recover the packed value of an
+    FP-typed abstraction proxy. \\
+Lemma handling
+  & Ensure class lemmas contain no original \texttt{FP\_DIV}.  Cache and
+    backtrack lemmas like existing abstraction lemmas.  Mark Full-Link as
+    non-abstractable. \\
+Statistics
+  & Count abstracted FP divisions, candidate checks, each class-lemma kind,
+    exact matches, and full-link fallbacks. \\
+Tests
+  & Add unit tests for proxy typing/word-blasting and differential regressions
+    comparing abstraction on and off. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Refinement algorithm}
+
+The control structure should be explicit about the distinction between a
+class mismatch and a numeric mismatch.
+
+\begin{lstlisting}[style=plan,caption={Class-first checking for one abstracted FP division.}]
+check_fp_div(proxy a, term div(r, x, y)):
+    vr, vx, vy, va := model_value(r, x, y, a)
+    expected       := eval_fp_div(vr, vx, vy)
+    if smt_equal(va, expected):
+        return CONSISTENT
+
+    for lemma in [NAN_POS, NAN_NEG, INF_SPECIAL,
+                  ZERO_SPECIAL, SIGN]:
+        if lemma is false in the candidate:
+            add(lemma(r, x, y, a))
+            return REFINED
+
+    add_no_abstract(a = fp.div(r, x, y))
+    return REFINED_BY_FULL_LINK
+\end{lstlisting}
+
+The normal mode adds the first violated class lemma, matching the current lazy
+abstraction strategy.  An eager mode may add all violated class lemmas in one
+iteration.  Exact candidate evaluation remains mandatory in either mode.
+
+\subsection{Correctness argument}
+
+The abstract formula is an over-approximation because any model of the
+original formula extends to a model of the abstraction by assigning
+\(\proxy=d\).  Every class lemma in Sect.~\ref{sec:class-lemmas} is a logical
+consequence of IEEE/SMT floating-point division \cite{IEEE754}; therefore, an
+UNSAT result after adding these lemmas implies UNSAT of the original formula.
+
+A SAT result is returned only after every active proxy passes exact candidate
+validation.  Replacing each proxy value by the corresponding evaluated
+division value then preserves all surrounding constraints, yielding a model
+of the original formula.  Finally, Full-Link reduces unresolved cases to the
+existing complete word-blasted encoding.  Thus the initial implementation is
+sound and complete even if the class lemmas provide no performance gain.
+
+\subsection{Milestones and evaluation}
+
+The recommended implementation order is:
+\begin{enumerate}
+  \item FP proxy creation, validity, and model-value recovery;
+  \item abstraction with immediate Full-Link, establishing an end-to-end
+        correctness baseline;
+  \item the NaN lemmas from Sect.~\ref{subsec:nan};
+  \item special infinity, zero, and sign lemmas;
+  \item statistics and AIG/CNF measurements; and
+  \item only after the measurements, finer exponent or significand lemmas.
+\end{enumerate}
+
+For each benchmark, measure wall time, number of SAT calls, number and kind of
+refinements, number of full-link fallbacks, and reachable AIG/CNF size.  The
+most informative encoding comparison is: full \(\fpdiv\), a class predicate
+obtained through the full SymFPU result, and the direct class lemma proposed
+below.
+
+\section{Design of Classification Lemmas}
+\label{sec:class-lemmas}
+
+\subsection{Notation and source semantics}
+
+For a valid floating-point term \(t\), define
+\[
+\begin{array}{lll}
+  \isnan(t)  &\text{iff }t\text{ is NaN},&
+  \isinf(t)  \text{ iff }t\text{ is infinite},\\
+  \iszero(t) &\text{iff }t\text{ is }+0\text{ or }-0,&
+  \signbit(t)\text{ iff }t\text{ is negative}.
+\end{array}
+\]
+The implementation should use Bitwuzla's existing floating-point
+classification nodes for NaN, infinity, zero, and negativity.  SymFPU defines
+NaN as neither positive nor negative, so sign lemmas are guarded against NaN.
+
+The pinned SymFPU implementation first constructs and rounds an arithmetic
+quotient, then applies three prioritized bypasses:
+\[
+  \mathsf{if}\ C_N\ \mathsf{then}\ \mathrm{NaN}\
+  \mathsf{else\ if}\ B_I\ \mathsf{then}\ \mathrm{Inf}\
+  \mathsf{else\ if}\ B_Z\ \mathsf{then}\ \mathrm{Zero}\
+  \mathsf{else}\ \mathrm{roundedQuotient}.
+\]
+This structure appears in
+\path{subprojects/symfpu/core/divide.h}.  It is the semantic source for the
+class lemmas below.
+
+Let \(x\) be the dividend and \(y\) the divisor.  Introduce the operand-only
+conditions
+\begin{align}
+  C_N ={}& \isnan(x) \lor \isnan(y)
+       \lor (\isinf(x) \land \isinf(y))
+       \lor (\iszero(x) \land \iszero(y)),
+       \label{eq:cn}\\
+  B_I ={}& (\neg\iszero(x) \land \iszero(y))
+       \lor (\isinf(x) \land \neg\isinf(y)),
+       \label{eq:bi}\\
+  B_Z ={}& (\neg\isinf(x) \land \isinf(y))
+       \lor (\iszero(x) \land \neg\iszero(y)).
+       \label{eq:bz}
+\end{align}
+To mirror the prioritized ITE exactly, define
+\begin{align}
+  C_I & = \neg C_N \land B_I,
+       \label{eq:ci}\\
+  C_Z & = \neg C_N \land \neg B_I \land B_Z.
+       \label{eq:cz}
+\end{align}
+The \(\neg B_I\) conjunct is redundant for valid non-NaN operand classes, but
+retaining it documents and preserves the SymFPU branch priority.
+
+The rounding mode does not occur in Eqs.~\eqref{eq:cn}--\eqref{eq:cz}:
+these conditions describe only the special-value bypasses.  Rounding is
+relevant to finite overflow and underflow, which is why some lemmas below are
+one-directional.
+
+\subsection{Exact NaN refinement}
+\label{subsec:nan}
+
+Division produces NaN exactly when an operand is NaN, both operands are
+infinite, or both operands are zero.  Rounding a non-special quotient does not
+create NaN.  Hence the strongest cheap class fact is
+\[
+  \isnan(\proxy) \leftrightarrow C_N.
+  \tag{NAN}
+\]
+For lazy candidate-driven refinement, split the equivalence into two lemmas:
+\begin{align}
+  L_{N+}:&\quad C_N \Longrightarrow \isnan(\proxy),
+       \label{lem:nan-pos}\\
+  L_{N-}:&\quad \isnan(\proxy) \Longrightarrow C_N.
+       \label{lem:nan-neg}
+\end{align}
+This permits the solver to add only the violated direction.  For example,
+\(0/0\), \(\infty/\infty\), and any operation with a NaN operand violate
+\(L_{N+}\) whenever the proxy is assigned a non-NaN value.  Conversely,
+\(L_{N-}\) eliminates a spurious NaN proxy for ordinary finite operands.
+
+\subsection{Special infinity refinement}
+
+The infinity bypass covers a nonzero value divided by zero and infinity
+divided by a non-infinite value.  The corresponding sound lemma is
+\[
+  L_I:\quad C_I \Longrightarrow \isinf(\proxy).
+  \tag{INF-SPECIAL}
+\]
+This lemma must \emph{not} be strengthened to an equivalence.  A finite,
+nonzero quotient may overflow during rounding and become infinity even when
+\(C_I\) is false.  The exact overflow condition depends on exponent,
+significand, sign, and rounding mode and belongs to a later refinement stage.
+
+\subsection{Special zero refinement}
+
+The zero bypass covers a non-infinite value divided by infinity and zero
+divided by a nonzero value.  The corresponding lemma is
+\[
+  L_Z:\quad C_Z \Longrightarrow \iszero(\proxy).
+  \tag{ZERO-SPECIAL}
+\]
+Again, the converse is unsound: a finite nonzero quotient may underflow and
+round to signed zero while \(C_Z\) is false.  The SymFPU rounder explicitly
+selects zero or the minimum subnormal according to the rounding mode and sign.
+
+\subsection{Sign refinement}
+
+For every non-NaN division result, IEEE division uses the exclusive-or of the
+operand signs.  This remains true for normal, subnormal, infinite, and signed
+zero results.  Since \(\signbit(t)\) is false for NaN in the SMT-LIB
+classification semantics, use the guarded lemma
+\[
+  L_S:\quad
+  \neg\isnan(\proxy) \Longrightarrow
+  \bigl(\signbit(\proxy)
+  \leftrightarrow
+  (\signbit(x)\oplus\signbit(y))\bigr).
+  \tag{SIGN}
+\]
+When the guard holds, Eq.~\eqref{eq:cn} and the NaN lemmas ensure that neither
+operand is NaN, so \(\signbit(x)\) and \(\signbit(y)\) expose their actual sign
+bits.  The rounding mode is irrelevant to this lemma.
+
+\subsection{Candidate-driven lemma selection}
+
+Table~\ref{tab:selection} defines the initial lazy policy.  Lemmas are tested
+in table order.  Earlier lemmas establish cleaner class assignments for later
+checks.
+
+\begin{table}[t]
+\centering
+\caption{Class-first refinement decisions for a candidate model.}
+\label{tab:selection}
+\small
+\begin{tabular}{p{0.43\textwidth}p{0.21\textwidth}p{0.25\textwidth}}
+\toprule
+Observed candidate condition & Add & Purpose \\
+\midrule
+\(C_N\) and \(\neg\isnan(\proxy)\)
+  & \(L_{N+}\) & Force a required NaN. \\
+\(\neg C_N\) and \(\isnan(\proxy)\)
+  & \(L_{N-}\) & Reject a spurious NaN. \\
+\(C_I\) and \(\neg\isinf(\proxy)\)
+  & \(L_I\) & Enforce a special infinity. \\
+\(C_Z\) and \(\neg\iszero(\proxy)\)
+  & \(L_Z\) & Enforce a special signed zero class. \\
+Non-NaN proxy and incorrect sign XOR
+  & \(L_S\) & Enforce the division sign. \\
+No class violation, but \(v_{\proxy}\ne v_d\)
+  & Full-Link & Restore complete division semantics. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+All conditions are evaluated using the current model before building a lemma.
+The instantiated formulas themselves remain symbolic and globally valid.  A
+lemma cache prevents duplicates across repeated candidates.
+
+\subsection{Cost discipline}
+
+The central implementation rule is that a class lemma may not construct the
+original division term.  In particular, it must not contain
+\[
+  \fpdiv(r,x,y).
+\]
+For example, the right-hand side of \(L_{N+}\) must be constructed directly
+from classifications of \(x\) and \(y\), rather than as
+\(\isnan(\fpdiv(r,x,y))\).  The latter calls SymFPU's complete
+\texttt{divide()} constructor before selecting the NaN field.  Even if dead
+quotient components are later excluded from the reachable SAT cone, their DAG
+construction cost is paid and the intended abstraction boundary becomes
+unclear.
+
+Direct lemmas use only classifications already supported by the FP
+word-blaster.  Their reachable cones contain operand/proxy validity and a
+small Boolean network; they do not contain fixed-point significand division,
+normalization, or rounding.
+
+\subsection{Validation matrix}
+
+Table~\ref{tab:matrix} is the minimum semantic test matrix.  Each row must be
+tested with all sign combinations where meaningful and with symbolic as well
+as concrete rounding modes.
+
+\begin{table}[t]
+\centering
+\caption{Minimum tests for classification refinement.}
+\label{tab:matrix}
+\small
+\begin{tabular}{lll}
+\toprule
+Operands & Required result class & Primary lemma \\
+\midrule
+NaN / any, any / NaN & NaN & \(L_{N+}\) \\
+\(+\infty/-\infty\) & NaN & \(L_{N+}\) \\
+\(+0/-0\) & NaN & \(L_{N+}\) \\
+finite nonzero / zero & signed infinity & \(L_I,L_S\) \\
+infinity / finite nonzero & signed infinity & \(L_I,L_S\) \\
+finite / infinity & signed zero & \(L_Z,L_S\) \\
+zero / finite nonzero & signed zero & \(L_Z,L_S\) \\
+large finite / tiny finite & possible rounded infinity & no converse \(L_I\) \\
+tiny finite / large finite & possible rounded zero & no converse \(L_Z\) \\
+ordinary finite / finite & exact finite quotient & Full-Link initially \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Differential regression tests should solve every case with FP division
+abstraction both enabled and disabled, compare SAT/UNSAT, and validate models.
+Formats should include Float16, Float32, Float64, and Float128.  If experimental
+formats are enabled, exhaustive tiny formats are particularly useful for
+checking the class lemmas and the exact candidate evaluator.
+
+\subsection{Acceptance criteria for the first implementation}
+
+The FP-division milestone is complete only when all of the following hold:
+\begin{enumerate}
+  \item no \(\mathsf{FP\_DIV}\) arithmetic circuit is reachable before a
+        refinement requires it;
+  \item all class lemmas are validated against exhaustive small-format values
+        or an independent abstraction-off solver;
+  \item an accepted SAT candidate has exact proxy values, not merely matching
+        classes;
+  \item the Full-Link fallback cannot be re-abstracted;
+  \item model production, incremental push/pop, unsat cores, and nested/shared
+        division terms remain correct; and
+  \item abstraction-off behavior and performance are unchanged.
+\end{enumerate}
+
+\bibliographystyle{splncs04}
+\bibliography{references}
+
+\end{document}
